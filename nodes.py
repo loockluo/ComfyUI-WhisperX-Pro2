@@ -179,3 +179,190 @@ class LoadAudioPath:
     def load_audio(self, audio):
         audio_path = folder_paths.get_annotated_filepath(audio)
         return (audio_path,)
+
+
+class WhisperXTextAlign:
+    @classmethod
+    def INPUT_TYPES(s):
+        translator_list = ['alibaba', 'apertium', 'argos', 'baidu', 'bing',
+        'caiyun', 'cloudTranslation', 'deepl', 'elia', 'google',
+        'hujiang', 'iciba', 'iflytek', 'iflyrec', 'itranslate',
+        'judic', 'languageWire', 'lingvanex', 'mglip', 'mirai',
+        'modernMt', 'myMemory', 'niutrans', 'papago', 'qqFanyi',
+        'qqTranSmart', 'reverso', 'sogou', 'sysTran', 'tilde',
+        'translateCom', 'translateMe', 'utibet', 'volcEngine', 'yandex',
+        'yeekit', 'youdao']
+        lang_list = ["zh","en","ja","ko","ru","fr","de","es","pt","it","ar","nl","uk","cs","pl","hu","fi","fa","el","tr","da","he","vi","te","hi","ca","ml","no","nn"]
+        return {"required":
+                    {"audio": ("AUDIOPATH",),
+                     "text": ("STRING", {
+                         "multiline": True,
+                         "default": "在这里输入需要对齐的文本..."
+                     }),
+                     "language": (lang_list, {
+                         "default": "zh"
+                     }),
+                     "if_mutiple_speaker": ("BOOLEAN", {
+                         "default": False
+                     }),
+                     "use_auth_token": ("STRING", {
+                         "default": "put your huggingface user auth token here for Assign speaker labels"
+                     }),
+                     "if_translate": ("BOOLEAN", {
+                         "default": False
+                     }),
+                     "translator": (translator_list, {
+                         "default": "alibaba"
+                     }),
+                     "to_language": (lang_list, {
+                         "default": "en"
+                     })
+                     },
+                }
+
+    CATEGORY = "AIFSH_WhisperX"
+
+    RETURN_TYPES = ("SRT","SRT")
+    RETURN_NAMES = ("ori_SRT","trans_SRT")
+    FUNCTION = "align_text"
+
+    def align_text(self, audio, text, language, if_mutiple_speaker,
+                   use_auth_token, if_translate, translator, to_language):
+        compute_type = "float16"
+
+        base_name = os.path.basename(audio)[:-4]
+        device = "cuda" if cuda_malloc.cuda_malloc_supported() else "cpu"
+
+        # 1. Load audio
+        audio_data = whisperx.load_audio(audio)
+
+        # 2. Load VAD model to detect speech segments
+        from whisperx.vad import load_vad_model, merge_chunks
+        from whisperx.audio import SAMPLE_RATE
+        vad_model = load_vad_model(device)
+        vad_segments = vad_model({"waveform": torch.from_numpy(audio_data).unsqueeze(0), "sample_rate": SAMPLE_RATE})
+        vad_segments = merge_chunks(
+            vad_segments,
+            chunk_size=30,
+            onset=0.500,
+            offset=0.363,
+        )
+
+        if len(vad_segments) == 0:
+            raise ValueError("No speech detected in audio file")
+
+        # 3. Preprocess text: split into sentences
+        import nltk
+        try:
+            # Try to use punkt tokenizer
+            from nltk.tokenize import sent_tokenize
+            # Download punkt if not available
+            try:
+                sentences = sent_tokenize(text, language='english' if language == 'en' else language)
+            except:
+                # Fallback: download punkt
+                nltk.download('punkt', quiet=True)
+                sentences = sent_tokenize(text, language='english' if language == 'en' else language)
+        except:
+            # Fallback: simple split by newlines or periods
+            if '\n' in text:
+                sentences = [s.strip() for s in text.split('\n') if s.strip()]
+            else:
+                sentences = [s.strip() + '.' for s in text.split('.') if s.strip()]
+
+        # 4. Map sentences to VAD segments
+        segments = []
+        num_sentences = len(sentences)
+        num_vad = len(vad_segments)
+
+        if num_sentences == 0:
+            raise ValueError("No sentences found in text")
+
+        # Simple strategy: distribute sentences evenly across VAD segments
+        if num_sentences <= num_vad:
+            # More VAD segments than sentences, assign one sentence per VAD segment
+            for i, sentence in enumerate(sentences):
+                if i < len(vad_segments):
+                    segments.append({
+                        "text": sentence,
+                        "start": vad_segments[i]["start"],
+                        "end": vad_segments[i]["end"]
+                    })
+        else:
+            # More sentences than VAD segments, group sentences
+            sentences_per_vad = num_sentences / num_vad
+            sentence_idx = 0
+            for vad_idx, vad_seg in enumerate(vad_segments):
+                # Calculate how many sentences for this VAD segment
+                start_sentence_idx = sentence_idx
+                end_sentence_idx = min(int((vad_idx + 1) * sentences_per_vad), num_sentences)
+
+                # Combine sentences for this segment
+                combined_text = " ".join(sentences[start_sentence_idx:end_sentence_idx])
+
+                if combined_text.strip():
+                    segments.append({
+                        "text": combined_text,
+                        "start": vad_seg["start"],
+                        "end": vad_seg["end"]
+                    })
+
+                sentence_idx = end_sentence_idx
+
+        # 5. Load alignment model
+        model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
+
+        # 6. Align text to audio
+        result = whisperx.align(segments, model_a, metadata, audio_data, device, return_char_alignments=False)
+
+        # Clean up alignment model
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        del model_a
+
+        # 7. Optional: Assign speaker labels
+        if if_mutiple_speaker:
+            diarize_model = whisperx.DiarizationPipeline(use_auth_token=use_auth_token, device=device)
+            diarize_segments = diarize_model(audio_data)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+            gc.collect()
+            torch.cuda.empty_cache()
+            del diarize_model
+
+        # 8. Generate SRT files
+        srt_path = os.path.join(out_path, f"{time.time()}_{base_name}_aligned.srt")
+        trans_srt_path = os.path.join(out_path, f"{time.time()}_{base_name}_aligned_{to_language}.srt")
+
+        srt_line = []
+        trans_srt_line = []
+
+        for i, res in enumerate(tqdm(result["segments"], desc="Generating SRT...", total=len(result["segments"]))):
+            start = timedelta(seconds=res['start'])
+            end = timedelta(seconds=res['end'])
+
+            # Try to get speaker name
+            try:
+                # Check if there are words with speaker info
+                speaker_name = ""
+                if 'words' in res and len(res['words']) > 0 and 'speaker' in res['words'][0]:
+                    speaker_name = res['words'][0]["speaker"][-1] + ": "
+            except:
+                speaker_name = ""
+
+            content = res['text']
+            srt_line.append(srt.Subtitle(index=i+1, start=start, end=end, content=speaker_name + content))
+
+            if if_translate:
+                translated_content = ts.translate_text(query_text=content, translator=translator, to_language=to_language)
+                trans_srt_line.append(srt.Subtitle(index=i+1, start=start, end=end, content=speaker_name + translated_content))
+
+        with open(srt_path, 'w', encoding="utf-8") as f:
+            f.write(srt.compose(srt_line))
+        with open(trans_srt_path, 'w', encoding="utf-8") as f:
+            f.write(srt.compose(trans_srt_line))
+
+        if if_translate:
+            return (srt_path, trans_srt_path)
+        else:
+            return (srt_path, srt_path)
